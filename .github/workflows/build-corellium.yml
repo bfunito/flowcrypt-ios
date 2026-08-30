@@ -7,6 +7,7 @@ on:
       - master
     paths:
       - .github/workflows/build-corellium.yml
+      - .github/scripts/sign_corellium.py
 
 permissions:
   contents: read
@@ -29,9 +30,6 @@ jobs:
 
           echo 'Configured GitHub URL rewrites:'
           git config --global --get-all 'url.https://github.com/.insteadOf'
-
-          # This exact URL is the mailcore2/libetpan submodule that previously failed.
-          # If rewriting is not effective, fail here before spending time resolving SwiftPM.
           git ls-remote git@github.com:Marketcircle/libetpan HEAD
 
       - name: Show environment
@@ -68,98 +66,15 @@ jobs:
 
           test -d "$RUNNER_TEMP/FlowCrypt.xcarchive/Products/Applications/FlowCrypt.app"
 
-      - name: Ad-hoc sign for jailbroken Corellium
+      - name: Sign and verify Corellium app
         shell: bash
         run: |
           set -euo pipefail
-
           APP="$RUNNER_TEMP/FlowCrypt.xcarchive/Products/Applications/FlowCrypt.app"
-          test -d "$APP"
-
-          # Use FlowCrypt's real Apple App ID prefix so the pseudo-signed build has
-          # the same application/keychain namespace shape as a normal FlowCrypt build.
-          TEAM_ID="6DZ6CC3YMY"
-          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
-          APP_ID="$TEAM_ID.$BUNDLE_ID"
-          APP_ENTITLEMENTS="$RUNNER_TEMP/corellium-app.entitlements"
-
-          cp FlowCrypt/FlowCryptRelease.entitlements "$APP_ENTITLEMENTS"
-          /usr/libexec/PlistBuddy -c "Add :application-identifier string $APP_ID" "$APP_ENTITLEMENTS"
-          /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $TEAM_ID" "$APP_ENTITLEMENTS"
-          /usr/libexec/PlistBuddy -c 'Add :keychain-access-groups array' "$APP_ENTITLEMENTS"
-          /usr/libexec/PlistBuddy -c "Add :keychain-access-groups:0 string $APP_ID" "$APP_ENTITLEMENTS"
-
-          echo "Signing bundle: $BUNDLE_ID"
-          echo "application-identifier: $APP_ID"
-          plutil -p "$APP_ENTITLEMENTS"
-
-          # Sign nested code first because signing the app seals its contents.
-          if [ -d "$APP/Frameworks" ]; then
-            while IFS= read -r ITEM; do
-              codesign --force --sign - --timestamp=none "$ITEM"
-            done < <(
-              find "$APP/Frameworks" \
-                \( -type d -name '*.framework' -o -type f -name '*.dylib' \) \
-                -print | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-
-            )
-          fi
-
-          # If the archive ever contains app extensions, give each one a valid
-          # application-identifier as well before sealing the containing app.
-          if [ -d "$APP/PlugIns" ]; then
-            while IFS= read -r APPEX; do
-              APPEX_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APPEX/Info.plist")"
-              APPEX_ID="$TEAM_ID.$APPEX_BUNDLE_ID"
-              APPEX_ENTITLEMENTS="$RUNNER_TEMP/$(basename "$APPEX").entitlements"
-
-              cat > "$APPEX_ENTITLEMENTS" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>application-identifier</key>
-            <string>$APPEX_ID</string>
-            <key>com.apple.developer.team-identifier</key>
-            <string>$TEAM_ID</string>
-            <key>keychain-access-groups</key>
-            <array>
-              <string>$APPEX_ID</string>
-            </array>
-          </dict>
-          </plist>
-          EOF
-
-              codesign \
-                --force \
-                --sign - \
-                --timestamp=none \
-                --entitlements "$APPEX_ENTITLEMENTS" \
-                "$APPEX"
-            done < <(find "$APP/PlugIns" -type d -name '*.appex' -print)
-          fi
-
-          codesign \
-            --force \
-            --sign - \
-            --timestamp=none \
-            --entitlements "$APP_ENTITLEMENTS" \
-            "$APP"
-
-          codesign --verify --deep --strict --verbose=2 "$APP"
-
-          # Installation on modern iOS fails before launch when this entitlement
-          # is absent. Treat that as a build failure instead of uploading a bad IPA.
-          SIGNED_ENTITLEMENTS="$RUNNER_TEMP/signed-app.entitlements"
-          codesign --display --entitlements - --xml "$APP" > "$SIGNED_ENTITLEMENTS"
-          ACTUAL_APP_ID="$(plutil -extract application-identifier raw -o - "$SIGNED_ENTITLEMENTS")"
-          ACTUAL_TEAM_ID="$(plutil -extract com.apple.developer.team-identifier raw -o - "$SIGNED_ENTITLEMENTS")"
-          ACTUAL_KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw -o - "$SIGNED_ENTITLEMENTS")"
-
-          test "$ACTUAL_APP_ID" = "$APP_ID"
-          test "$ACTUAL_TEAM_ID" = "$TEAM_ID"
-          test "$ACTUAL_KEYCHAIN_GROUP" = "$APP_ID"
-
-          cp "$SIGNED_ENTITLEMENTS" "$GITHUB_WORKSPACE/corellium-signed-entitlements.plist"
+          python3 .github/scripts/sign_corellium.py \
+            "$APP" \
+            6DZ6CC3YMY \
+            "$GITHUB_WORKSPACE/corellium-signed-entitlements.plist"
 
       - name: Package and verify IPA
         shell: bash
@@ -170,7 +85,7 @@ jobs:
           PACKAGE="$RUNNER_TEMP/package"
           rm -rf "$PACKAGE"
           mkdir -p "$PACKAGE/Payload"
-          cp -R "$APP" "$PACKAGE/Payload/"
+          ditto "$APP" "$PACKAGE/Payload/FlowCrypt.app"
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           IPA="$GITHUB_WORKSPACE/FlowCrypt-Corellium-${SHORT_SHA}.ipa"
@@ -181,7 +96,6 @@ jobs:
 
           unzip -t "$IPA"
 
-          # Verify the actual packaged artifact, not just the pre-package .app.
           VERIFY_DIR="$RUNNER_TEMP/verify-ipa"
           rm -rf "$VERIFY_DIR"
           mkdir -p "$VERIFY_DIR"
@@ -189,17 +103,15 @@ jobs:
 
           PACKAGED_APP="$VERIFY_DIR/Payload/FlowCrypt.app"
           test -d "$PACKAGED_APP"
-          codesign --verify --deep --strict --verbose=2 "$PACKAGED_APP"
 
-          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PACKAGED_APP/Info.plist")"
-          EXPECTED_APP_ID="6DZ6CC3YMY.$BUNDLE_ID"
-          PACKAGED_ENTITLEMENTS="$RUNNER_TEMP/packaged-app.entitlements"
-          codesign --display --entitlements - --xml "$PACKAGED_APP" > "$PACKAGED_ENTITLEMENTS"
-          PACKAGED_APP_ID="$(plutil -extract application-identifier raw -o - "$PACKAGED_ENTITLEMENTS")"
-          PACKAGED_KEYCHAIN_GROUP="$(plutil -extract keychain-access-groups.0 raw -o - "$PACKAGED_ENTITLEMENTS")"
+          python3 .github/scripts/sign_corellium.py \
+            "$PACKAGED_APP" \
+            6DZ6CC3YMY \
+            "$RUNNER_TEMP/packaged-app-entitlements.plist" \
+            --verify-only
 
-          test "$PACKAGED_APP_ID" = "$EXPECTED_APP_ID"
-          test "$PACKAGED_KEYCHAIN_GROUP" = "$EXPECTED_APP_ID"
+          BUNDLE_ID="$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["CFBundleIdentifier"])' "$PACKAGED_APP/Info.plist")"
+          APP_ID="$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["application-identifier"])' "$RUNNER_TEMP/packaged-app-entitlements.plist")"
 
           {
             echo "Commit: $(git rev-parse HEAD)"
@@ -207,8 +119,7 @@ jobs:
             xcodebuild -version
             echo
             echo "Bundle ID: $BUNDLE_ID"
-            echo "application-identifier: $PACKAGED_APP_ID"
-            echo "keychain-access-group: $PACKAGED_KEYCHAIN_GROUP"
+            echo "application-identifier: $APP_ID"
             echo
             shasum -a 256 "$IPA"
           } > build-info.txt
