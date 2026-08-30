@@ -1,0 +1,119 @@
+name: Build FlowCrypt for Corellium
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          git rev-parse HEAD
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project FlowCrypt.xcodeproj \
+            -scheme "FlowCrypt" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackagePluginValidation \
+            -skipMacroValidation
+
+      - name: Archive unsigned device build
+        run: |
+          xcodebuild \
+            -project FlowCrypt.xcodeproj \
+            -scheme "FlowCrypt" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/FlowCrypt.xcarchive" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            archive
+
+      - name: Ad-hoc sign for jailbroken Corellium
+        run: |
+          set -euo pipefail
+
+          APP="$RUNNER_TEMP/FlowCrypt.xcarchive/Products/Applications/FlowCrypt.app"
+
+          test -d "$APP"
+
+          # Sign embedded dylibs first.
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -type f -name '*.dylib' -print0 |
+            while IFS= read -r -d '' FILE; do
+              codesign --force --sign - --timestamp=none "$FILE"
+            done
+
+            # Then sign embedded frameworks.
+            find "$APP/Frameworks" -type d -name '*.framework' -print0 |
+            while IFS= read -r -d '' FRAMEWORK; do
+              codesign --force --sign - --timestamp=none "$FRAMEWORK"
+            done
+          fi
+
+          # Sign any app extensions before the main application.
+          if [ -d "$APP/PlugIns" ]; then
+            find "$APP/PlugIns" -type d -name '*.appex' -print0 |
+            while IFS= read -r -d '' APPEX; do
+              codesign --force --sign - --timestamp=none "$APPEX"
+            done
+          fi
+
+          codesign \
+            --force \
+            --sign - \
+            --timestamp=none \
+            --entitlements FlowCrypt/FlowCryptRelease.entitlements \
+            "$APP"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+
+          APP="$RUNNER_TEMP/FlowCrypt.xcarchive/Products/Applications/FlowCrypt.app"
+
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/package/Payload/"
+
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          IPA="$GITHUB_WORKSPACE/FlowCrypt-Corellium-${SHORT_SHA}.ipa"
+
+          cd "$RUNNER_TEMP/package"
+          zip -qry "$IPA" Payload
+
+          cd "$GITHUB_WORKSPACE"
+
+          {
+            echo "Commit: $(git rev-parse HEAD)"
+            echo
+            xcodebuild -version
+            echo
+            shasum -a 256 "$IPA"
+          } > build-info.txt
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowCrypt-Corellium
+          path: |
+            FlowCrypt-Corellium-*.ipa
+            build-info.txt
+          retention-days: 14
