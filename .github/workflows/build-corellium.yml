@@ -2,6 +2,11 @@ name: Build FlowCrypt for Corellium
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/build-corellium.yml
 
 permissions:
   contents: read
@@ -14,10 +19,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Force GitHub dependencies to use HTTPS
+      - name: Force GitHub SSH dependencies to HTTPS
+        shell: bash
         run: |
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          set -euo pipefail
+          git config --global --unset-all 'url.https://github.com/.insteadOf' || true
+          git config --global --add 'url.https://github.com/.insteadOf' 'git@github.com:'
+          git config --global --add 'url.https://github.com/.insteadOf' 'ssh://git@github.com/'
+
+          echo 'Configured GitHub URL rewrites:'
+          git config --global --get-all 'url.https://github.com/.insteadOf'
+
+          # This exact URL is the mailcore2/libetpan submodule that previously failed.
+          # If rewriting is not effective, fail here before spending time resolving SwiftPM.
+          git ls-remote git@github.com:Marketcircle/libetpan HEAD
 
       - name: Show environment
         run: |
@@ -37,6 +52,7 @@ jobs:
 
       - name: Archive unsigned device build
         run: |
+          set -euo pipefail
           xcodebuild \
             -project FlowCrypt.xcodeproj \
             -scheme "FlowCrypt" \
@@ -50,34 +66,31 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             archive
 
+          test -d "$RUNNER_TEMP/FlowCrypt.xcarchive/Products/Applications/FlowCrypt.app"
+
       - name: Ad-hoc sign for jailbroken Corellium
+        shell: bash
         run: |
           set -euo pipefail
 
           APP="$RUNNER_TEMP/FlowCrypt.xcarchive/Products/Applications/FlowCrypt.app"
-
           test -d "$APP"
 
-          # Sign embedded dylibs first.
+          # Sign Mach-O code inside Frameworks from the deepest paths outward.
           if [ -d "$APP/Frameworks" ]; then
-            find "$APP/Frameworks" -type f -name '*.dylib' -print0 |
-            while IFS= read -r -d '' FILE; do
-              codesign --force --sign - --timestamp=none "$FILE"
-            done
-
-            # Then sign embedded frameworks.
-            find "$APP/Frameworks" -type d -name '*.framework' -print0 |
-            while IFS= read -r -d '' FRAMEWORK; do
-              codesign --force --sign - --timestamp=none "$FRAMEWORK"
-            done
+            while IFS= read -r ITEM; do
+              codesign --force --sign - --timestamp=none "$ITEM"
+            done < <(
+              find "$APP/Frameworks" \
+                \( -type d -name '*.framework' -o -type f -name '*.dylib' \) \
+                -print | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-
+            )
           fi
 
-          # Sign any app extensions before the main application.
           if [ -d "$APP/PlugIns" ]; then
-            find "$APP/PlugIns" -type d -name '*.appex' -print0 |
-            while IFS= read -r -d '' APPEX; do
+            while IFS= read -r APPEX; do
               codesign --force --sign - --timestamp=none "$APPEX"
-            done
+            done < <(find "$APP/PlugIns" -type d -name '*.appex' -print)
           fi
 
           codesign \
@@ -90,22 +103,23 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Package IPA
+        shell: bash
         run: |
           set -euo pipefail
 
           APP="$RUNNER_TEMP/FlowCrypt.xcarchive/Products/Applications/FlowCrypt.app"
-
-          mkdir -p "$RUNNER_TEMP/package/Payload"
-          cp -R "$APP" "$RUNNER_TEMP/package/Payload/"
+          PACKAGE="$RUNNER_TEMP/package"
+          rm -rf "$PACKAGE"
+          mkdir -p "$PACKAGE/Payload"
+          cp -R "$APP" "$PACKAGE/Payload/"
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           IPA="$GITHUB_WORKSPACE/FlowCrypt-Corellium-${SHORT_SHA}.ipa"
 
-          cd "$RUNNER_TEMP/package"
-          zip -qry "$IPA" Payload
+          cd "$PACKAGE"
+          /usr/bin/zip -qry "$IPA" Payload
 
           cd "$GITHUB_WORKSPACE"
-
           {
             echo "Commit: $(git rev-parse HEAD)"
             echo
@@ -114,6 +128,8 @@ jobs:
             shasum -a 256 "$IPA"
           } > build-info.txt
 
+          unzip -t "$IPA"
+
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
@@ -121,4 +137,5 @@ jobs:
           path: |
             FlowCrypt-Corellium-*.ipa
             build-info.txt
+          if-no-files-found: error
           retention-days: 14
