@@ -80,9 +80,9 @@ jobs:
           test -f "$BINARY"
 
           # x86Sim accepts ARM64 iOS Simulator executables, not iPhone device binaries.
-          lipo -verify_arch arm64 "$BINARY"
+          lipo "$BINARY" -verify_arch arm64
           xcrun vtool -show-build "$BINARY" | tee "$RUNNER_TEMP/macho-build-version.txt"
-          grep -Eq 'platform[[:space:]]+IOSSIMULATOR' "$RUNNER_TEMP/macho-build-version.txt"
+          grep -Eiq 'platform[[:space:]]+(IOSSIMULATOR|IOS_SIMULATOR|7)([[:space:]]|$)' "$RUNNER_TEMP/macho-build-version.txt"
 
           ZIP="$GITHUB_WORKSPACE/FlowCrypt-x86Sim-arm64.zip"
           ditto -c -k --keepParent "$APP" "$ZIP"
