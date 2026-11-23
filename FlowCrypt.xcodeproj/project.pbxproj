@@ -3568,8 +3568,8 @@
 					"@executable_path/Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = "$(inherited)";
-				// x86Sim's simulator securityd reads Keychain groups from __TEXT,__entitlements.
-				// Do not embed them in iphoneos (Corellium) builds.
+				/* x86Sim reads simulator Keychain groups from __TEXT,__entitlements. */
+				/* This linker flag is not applied to iphoneos (Corellium) builds. */
 				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
 					"$(inherited)",
 					"-Xlinker",
