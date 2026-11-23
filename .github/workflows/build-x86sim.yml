@@ -9,6 +9,8 @@ on:
       - master
     paths:
       - .github/workflows/build-x86sim.yml
+      - FlowCrypt.xcodeproj/project.pbxproj
+      - FlowCrypt/FlowCryptSimulator.entitlements
 
 permissions:
   contents: read
@@ -46,7 +48,7 @@ jobs:
             -skipPackagePluginValidation \
             -skipMacroValidation
 
-      - name: Build unsigned ARM64 iOS Simulator app
+      - name: Build ARM64 iOS Simulator app with Keychain entitlements
         shell: bash
         run: |
           set -euo pipefail
@@ -81,6 +83,10 @@ jobs:
 
           # x86Sim accepts ARM64 iOS Simulator executables, not iPhone device binaries.
           lipo "$BINARY" -verify_arch arm64
+          # Fail the job if the simulator-only Keychain section was not linked.
+          # x86Sim needs the executable's __TEXT,__entitlements for Security.framework.
+          xcrun otool -l "$BINARY" | grep -Fq 'sectname __entitlements'
+          plutil -lint FlowCrypt/FlowCryptSimulator.entitlements
           xcrun vtool -show-build "$BINARY" | tee "$RUNNER_TEMP/macho-build-version.txt"
           grep -Eiq 'platform[[:space:]]+(IOSSIMULATOR|IOS_SIMULATOR|7)([[:space:]]|$)' "$RUNNER_TEMP/macho-build-version.txt"
 
@@ -96,6 +102,7 @@ jobs:
             echo "Bundle ID: $BUNDLE_ID"
             echo "Executable: $EXECUTABLE"
             echo "Architectures: $(lipo -archs "$BINARY")"
+            echo "Simulator Keychain entitlements: __TEXT,__entitlements present"
             cat "$RUNNER_TEMP/macho-build-version.txt"
             echo
             shasum -a 256 "$ZIP"
