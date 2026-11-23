@@ -1,0 +1,112 @@
+# Builds a native ARM64 iOS Simulator app for x86Sim on Linux.
+# The existing Corellium workflow produces an iphoneos device IPA instead.
+name: Build FlowCrypt for x86Sim
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/build-x86sim.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Force GitHub SSH dependencies to HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --unset-all 'url.https://github.com/.insteadOf' || true
+          git config --global --add 'url.https://github.com/.insteadOf' 'git@github.com:'
+          git config --global --add 'url.https://github.com/.insteadOf' 'ssh://git@github.com/'
+
+      - name: Show environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          git rev-parse HEAD
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project FlowCrypt.xcodeproj \
+            -scheme "FlowCrypt" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackagePluginValidation \
+            -skipMacroValidation
+
+      - name: Build unsigned ARM64 iOS Simulator app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project FlowCrypt.xcodeproj \
+            -scheme "FlowCrypt" \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/FlowCryptSimulator" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Verify simulator binary and package app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$RUNNER_TEMP/FlowCryptSimulator/Build/Products/Release-iphonesimulator/FlowCrypt.app"
+          test -d "$APP"
+
+          EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          BINARY="$APP/$EXECUTABLE"
+          test -f "$BINARY"
+
+          # x86Sim accepts ARM64 iOS Simulator executables, not iPhone device binaries.
+          lipo -verify_arch arm64 "$BINARY"
+          xcrun vtool -show-build "$BINARY" | tee "$RUNNER_TEMP/macho-build-version.txt"
+          grep -Eq 'platform[[:space:]]+IOSSIMULATOR' "$RUNNER_TEMP/macho-build-version.txt"
+
+          ZIP="$GITHUB_WORKSPACE/FlowCrypt-x86Sim-arm64.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          unzip -t "$ZIP"
+
+          {
+            echo "Commit: $(git rev-parse HEAD)"
+            echo
+            xcodebuild -version
+            echo
+            echo "Bundle ID: $BUNDLE_ID"
+            echo "Executable: $EXECUTABLE"
+            echo "Architectures: $(lipo -archs "$BINARY")"
+            cat "$RUNNER_TEMP/macho-build-version.txt"
+            echo
+            shasum -a 256 "$ZIP"
+          } > "$GITHUB_WORKSPACE/build-info-x86sim.txt"
+
+      - name: Upload x86Sim app
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowCrypt-x86Sim-arm64
+          path: |
+            FlowCrypt-x86Sim-arm64.zip
+            build-info-x86sim.txt
+          if-no-files-found: error
+          retention-days: 14
